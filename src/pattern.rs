@@ -475,6 +475,45 @@ impl CronPattern {
         Ok(None) // No match found within the current range
     }
 
+    // Finds the previous hour that matches the hour part of the cron pattern.
+    pub fn previous_hour_match(&self, hour: u32) -> Result<Option<u32>, CronError> {
+        if hour > 23 {
+            return Err(CronError::InvalidTime);
+        }
+        for prev_hour in (0..=hour).rev() {
+            if self.hours.is_bit_set(prev_hour as u8, ALL_BIT)? {
+                return Ok(Some(prev_hour));
+            }
+        }
+        Ok(None) // No match found within the current range
+    }
+
+    // Finds the previous minute that matches the minute part of the cron pattern.
+    pub fn previous_minute_match(&self, minute: u32) -> Result<Option<u32>, CronError> {
+        if minute > 59 {
+            return Err(CronError::InvalidTime);
+        }
+        for prev_minute in (0..=minute).rev() {
+            if self.minutes.is_bit_set(prev_minute as u8, ALL_BIT)? {
+                return Ok(Some(prev_minute));
+            }
+        }
+        Ok(None) // No match found within the current range
+    }
+
+    // Finds the previous second that matches the second part of the cron pattern.
+    pub fn previous_second_match(&self, second: u32) -> Result<Option<u32>, CronError> {
+        if second > 59 {
+            return Err(CronError::InvalidTime);
+        }
+        for prev_second in (0..=second).rev() {
+            if self.seconds.is_bit_set(prev_second as u8, ALL_BIT)? {
+                return Ok(Some(prev_second));
+            }
+        }
+        Ok(None) // No match found within the current range
+    }
+
     // Method to set the dom_and_dow flag
     pub fn with_dom_and_dow(&mut self) -> &mut Self {
         self.dom_and_dow = true;

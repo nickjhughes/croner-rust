@@ -69,16 +69,19 @@ pub mod errors;
 mod component;
 mod iterator;
 mod pattern;
+mod reverse_iterator;
 
 use errors::CronError;
 pub use iterator::CronIterator;
 use pattern::CronPattern;
+pub use reverse_iterator::CronReverseIterator;
 use std::str::FromStr;
 
 use chrono::{
     DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike,
 };
 
+const YEAR_LOWER_LIMIT: i32 = 0;
 const YEAR_UPPER_LIMIT: i32 = 5000;
 
 enum TimeComponent {
@@ -259,6 +262,99 @@ impl Cron {
         }
     }
 
+    /// Finds the previous occurrence of a scheduled date and time that matches the cron pattern,
+    /// starting from a given `start_time`. If `inclusive` is `true`, the search includes the
+    /// `start_time`; otherwise, it starts from the previous second.
+    ///
+    /// This method performs a backwards search through time, beginning at `start_time`, to find the
+    /// nextprevious date and time that aligns with the cron pattern defined within the `Cron`
+    /// instance. The search respects cron fields (seconds, minutes, hours, day of month, month,
+    /// day of week) and iterates backwards through time until a match is found or an error occurs.
+    ///
+    /// # Parameters
+    ///
+    /// - `start_time`: A reference to a `DateTime<Tz>` indicating the start time for the search.
+    /// - `inclusive`: A `bool` that specifies whether the search should include `start_time` itself.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(DateTime<Tz>)`: The previous occurrence that matches the cron pattern.
+    /// - `Err(CronError)`: An error if the previous occurrence cannot be found within a reasonable
+    ///   limit, if any of the date/time manipulations result in an invalid date, or if the
+    ///   cron pattern match fails.
+    ///
+    /// # Errors
+    ///
+    /// - `CronError::InvalidTime`: If the start time provided is invalid or adjustments to the
+    ///   time result in an invalid date/time.
+    /// - `CronError::TimeSearchLimitExceeded`: If the search exceeds a reasonable time limit.
+    ///   This prevents infinite loops in case of patterns that cannot be matched.
+    /// - Other errors as defined by the `CronError` enum may occur if the pattern match fails
+    ///   at any stage of the search.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use chrono::Utc;
+    /// use croner::Cron;
+    ///
+    /// // Parse cron expression
+    /// let cron: Cron = Cron::new("0 18 * * * 5").with_seconds_required().parse().expect("Success");
+    ///
+    /// // Get previous match
+    /// let time = Utc::now();
+    /// let previous = cron.find_previous_occurrence(&time, false).unwrap();
+    ///
+    /// println!(
+    ///     "Pattern \"{}\" will match previous time at {}",
+    ///     cron.pattern.to_string(),
+    ///     previous
+    /// );
+    /// ```
+    pub fn find_previous_occurrence<Tz: TimeZone>(
+        &self,
+        start_time: &DateTime<Tz>,
+        inclusive: bool,
+    ) -> Result<DateTime<Tz>, CronError>
+    where
+        Tz: TimeZone,
+    {
+        let mut naive_time = start_time.naive_local();
+        let originaltimezone = start_time.timezone();
+
+        if !inclusive {
+            naive_time = naive_time
+                .checked_sub_signed(chrono::Duration::seconds(1))
+                .ok_or(CronError::InvalidTime)?;
+        }
+
+        loop {
+            dbg!(&naive_time);
+
+            let mut updated = false;
+
+            updated |= self.find_previous_matching_month(&mut naive_time)?;
+            updated |= self.find_previous_matching_day(&mut naive_time)?;
+            updated |= self.find_previous_matching_hour(&mut naive_time)?;
+            updated |= self.find_previous_matching_minute(&mut naive_time)?;
+            updated |= self.find_previous_matching_second(&mut naive_time)?;
+
+            if updated {
+                continue;
+            }
+
+            // Convert back to original timezone
+            let tz_datetime_result = from_naive(naive_time, &originaltimezone)?;
+
+            // Check for match
+            if self.is_time_matching(&tz_datetime_result)? {
+                return Ok(tz_datetime_result);
+            } else {
+                return Err(CronError::TimeSearchLimitExceeded);
+            }
+        }
+    }
+
     /// Creates a `CronIterator` starting from the specified time.
     ///
     /// This function will create an iterator that yields dates and times that
@@ -342,6 +438,94 @@ impl Cron {
             .checked_add_signed(Duration::seconds(1))
             .expect("Invalid date encountered when adding one second");
         CronIterator::new(self.clone(), start_from)
+    }
+
+    /// Creates a `CronReverseIterator` starting in reverse from the specified time.
+    ///
+    /// This function will create an iterator that yields dates and times that
+    /// match a cron schedule, beginning at `start_from` and moving backwards in time.
+    /// The iterator will begin at the specified start time if it matches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use chrono::Utc;
+    /// use croner::Cron;
+    ///
+    /// // Parse cron expression
+    /// let cron = Cron::new("* * * * *").parse().expect("Couldn't parse cron string");
+    ///
+    /// // Compare to time now
+    /// let time = Utc::now();
+    ///
+    /// // Get previous 5 matches using reverse_iter_from
+    /// println!("Finding reverse matches of pattern '{}' starting from {}:", cron.pattern.to_string(), time);
+    ///
+    /// for time in cron.clone().reverse_iter_from(time).take(5) {
+    ///     println!("{}", time);
+    /// }
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `start_from`: A `DateTime<Tz>` that represents the starting point for the iterator.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `CronReverseIterator<Tz>` that can be used to iterate over scheduled times.
+    pub fn reverse_iter_from<Tz>(&self, start_from: DateTime<Tz>) -> CronReverseIterator<Tz>
+    where
+        Tz: TimeZone,
+    {
+        CronReverseIterator::new(self.clone(), start_from)
+    }
+
+    /// Creates a `CronReverseIterator` starting before the specified time.
+    ///
+    /// This function will create an iterator that yields dates and times that
+    /// match a cron schedule, beginning before `start_before` and moving backwards in time.
+    /// The iterator will not yield the specified start time; it will yield times that come
+    /// before it according to the cron schedule.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use chrono::Utc;
+    /// use croner::Cron;
+    ///
+    /// // Parse cron expression
+    /// let cron = Cron::new("* * * * *").parse().expect("Couldn't parse cron string");
+    ///
+    /// // Compare to time now
+    /// let time = Utc::now();
+    ///
+    /// // Get next 5 matches using reverse_iter_before
+    /// println!("Finding reverse matches of pattern '{}' starting from {}:", cron.pattern.to_string(), time);
+    ///
+    /// for time in cron.clone().reverse_iter_before(time).take(5) {
+    ///     println!("{}", time);
+    /// }
+    ///  
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `start_before`: A `DateTime<Tz>` that represents the starting point for the iterator.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `CronReverseIterator<Tz>` that can be used to iterate over scheduled times.
+    pub fn reverse_iter_before<Tz: TimeZone>(
+        &self,
+        start_before: DateTime<Tz>,
+    ) -> CronReverseIterator<Tz>
+    where
+        Tz: TimeZone,
+    {
+        let start_from = start_before
+            .checked_sub_signed(Duration::seconds(1))
+            .expect("Invalid date encountered when subtracting one second");
+        CronReverseIterator::new(self.clone(), start_from)
     }
 
     // Internal functions to check for the next matching month/day/hour/minute/second and return the updated time.
@@ -434,6 +618,103 @@ impl Cron {
             }
         }
         Ok(incremented)
+    }
+
+    fn find_previous_matching_month(
+        &self,
+        current_time: &mut NaiveDateTime,
+    ) -> Result<bool, CronError> {
+        let mut decremented = false;
+        while !self.pattern.month_match(current_time.month())? {
+            decrement_time_component(current_time, TimeComponent::Month)?;
+            decremented = true;
+        }
+        Ok(decremented)
+    }
+
+    fn find_previous_matching_day(
+        &self,
+        current_time: &mut NaiveDateTime,
+    ) -> Result<bool, CronError> {
+        let mut decremented = false;
+        while !self.pattern.day_match(
+            current_time.year(),
+            current_time.month(),
+            current_time.day(),
+        )? {
+            decrement_time_component(current_time, TimeComponent::Day)?;
+            decremented = true;
+        }
+
+        Ok(decremented)
+    }
+
+    fn find_previous_matching_hour(
+        &self,
+        current_time: &mut NaiveDateTime,
+    ) -> Result<bool, CronError> {
+        let mut decremented = false;
+        let previous_hour_result = self.pattern.previous_hour_match(current_time.hour());
+
+        match previous_hour_result {
+            Ok(Some(previous_match)) if previous_match != current_time.hour() => {
+                set_time_component(current_time, TimeComponent::Hour, previous_match)?;
+            }
+            Ok(None) => {
+                decrement_time_component(current_time, TimeComponent::Day)?;
+                decremented = true;
+            }
+            Err(e) => return Err(e), // Propagate any CronError
+            _ => {}                  // No action needed if the current hour already matches
+        }
+        Ok(decremented)
+    }
+
+    fn find_previous_matching_minute(
+        &self,
+        current_time: &mut NaiveDateTime,
+    ) -> Result<bool, CronError> {
+        let mut decremented = false;
+        let previous_minute_result = self.pattern.previous_minute_match(current_time.minute());
+
+        match previous_minute_result {
+            Ok(Some(previous_match)) if previous_match != current_time.minute() => {
+                decremented = true;
+                set_time_component(current_time, TimeComponent::Minute, previous_match)?;
+            }
+            Ok(None) => {
+                decremented = true;
+                increment_time_component(current_time, TimeComponent::Hour)?;
+            }
+            Err(e) => return Err(e), // Propagate the CronError
+            _ => {}                  // No action needed if the current minute matches
+        }
+        Ok(decremented)
+    }
+
+    fn find_previous_matching_second(
+        &self,
+        current_time: &mut NaiveDateTime,
+    ) -> Result<bool, CronError> {
+        let mut decremented = false;
+        let previous_second_result = self.pattern.previous_second_match(current_time.second());
+
+        match previous_second_result {
+            Ok(Some(previous_match)) => {
+                // If a matching second is found, set it and mark as decremented.
+                set_time_component(current_time, TimeComponent::Second, previous_match)?;
+            }
+            Ok(None) => {
+                // If no match is found in the current minute, decrement the minute.
+                decrement_time_component(current_time, TimeComponent::Minute)?;
+                decremented = true;
+            }
+            Err(e) => {
+                // Propagate any errors encountered during the match process.
+                return Err(e);
+            }
+        }
+        Ok(decremented)
     }
 
     pub fn with_dom_and_dow(&mut self) -> &mut Self {
@@ -636,6 +917,54 @@ fn increment_time_component(
     }
 }
 
+fn decrement_time_component(
+    current_time: &mut NaiveDateTime,
+    component: TimeComponent,
+) -> Result<(), CronError> {
+    // Check for time overflow
+    if current_time.year() <= YEAR_LOWER_LIMIT {
+        return Err(CronError::TimeSearchLimitExceeded);
+    }
+
+    // Extract all parts
+    let (year, month, day, hour, minute, second) = (
+        current_time.year(),
+        current_time.month(),
+        current_time.day(),
+        current_time.hour(),
+        current_time.minute(),
+        current_time.second(),
+    );
+
+    // Decrement the component and try to set the new time.
+    match component {
+        TimeComponent::Year => set_time(current_time, year - 1, 1, 1, 0, 0, 0, component),
+        TimeComponent::Month => set_time(current_time, year, month - 1, 1, 0, 0, 0, component),
+        TimeComponent::Day => set_time(current_time, year, month, day - 1, 0, 0, 0, component),
+        TimeComponent::Hour => set_time(current_time, year, month, day, hour - 1, 0, 0, component),
+        TimeComponent::Minute => set_time(
+            current_time,
+            year,
+            month,
+            day,
+            hour,
+            minute - 1,
+            0,
+            component,
+        ),
+        TimeComponent::Second => set_time(
+            current_time,
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second - 1,
+            component,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,6 +1073,22 @@ mod tests {
     }
 
     #[test]
+    fn test_find_previous_occurrence() -> Result<(), CronError> {
+        let cron = Cron::new("* * * * * *").with_seconds_optional().parse()?;
+
+        // Set the start time to a known value.
+        let start_time = Local.with_ymd_and_hms(2023, 1, 1, 0, 0, 29).unwrap();
+        // Calculate the previous occurrence from the start time.
+        let previous_occurrence = cron.find_previous_occurrence(&start_time, false)?;
+
+        // Verify that the previous occurrence is at the expected time.
+        let expected_time = Local.with_ymd_and_hms(2023, 1, 1, 0, 0, 28).unwrap();
+        assert_eq!(previous_occurrence, expected_time);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_find_next_minute() -> Result<(), CronError> {
         let cron = Cron::new("* * * * *").parse()?;
 
@@ -755,6 +1100,22 @@ mod tests {
         // Verify that the next occurrence is at the expected time.
         let expected_time = Local.with_ymd_and_hms(2023, 1, 1, 0, 1, 0).unwrap();
         assert_eq!(next_occurrence, expected_time);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_previous_minute() -> Result<(), CronError> {
+        let cron = Cron::new("* * * * *").parse()?;
+
+        // Set the start time to a known value.
+        let start_time = Local.with_ymd_and_hms(2023, 1, 1, 0, 0, 29).unwrap();
+        // Calculate the previous occurrence from the start time.
+        let previous_occurrence = cron.find_previous_occurrence(&start_time, false)?;
+
+        // Verify that the previous occurrence is at the expected time.
+        let expected_time = Local.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+        assert_eq!(previous_occurrence, expected_time);
 
         Ok(())
     }
@@ -772,6 +1133,23 @@ mod tests {
         // Verify that the next occurrence is at the expected time.
         let expected_time = Local.with_ymd_and_hms(2024, 1, 1, 15, 0, 0).unwrap();
         assert_eq!(next_occurrence, expected_time);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wrap_month_and_year_reverse() -> Result<(), CronError> {
+        // This pattern is meant to match every day at 3pm.
+        let cron = Cron::new("0 0 15 * * *").with_seconds_optional().parse()?;
+
+        // Set the start time to a known value.
+        let start_time = Local.with_ymd_and_hms(2024, 1, 1, 14, 0, 0).unwrap();
+        // Calculate the previous occurrence from the start time.
+        let previous_occurrence = cron.find_previous_occurrence(&start_time, false)?;
+
+        // Verify that the next occurrence is at the expected time.
+        let expected_time = Local.with_ymd_and_hms(2023, 12, 31, 15, 0, 0).unwrap();
+        assert_eq!(previous_occurrence, expected_time);
 
         Ok(())
     }
